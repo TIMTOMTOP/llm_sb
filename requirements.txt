@@ -1,0 +1,11 @@
+torch
+numpy
+transformers
+datasets
+accelerate
+scikit-learn
+pandas
+tqdm
+matplotlib
+tiktoken
+ipywidgets
