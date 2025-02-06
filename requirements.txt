@@ -9,3 +9,5 @@ tqdm
 matplotlib
 tiktoken
 ipywidgets
+networkx
+astor
