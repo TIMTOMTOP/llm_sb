@@ -3,6 +3,7 @@ import astor
 import os
 import networkx as nx
 from typing import Optional
+import anthropic
 
 class SDKAnalyzer:
     def __init__(self, sdk_path: str):
@@ -265,7 +266,6 @@ class SDKAnalyzer:
 ########################################
 
 if __name__ == '__main__':
-    import anthropic
     # For example, using the anthropic package's directory as the SDK
     sdk_path = os.path.dirname(anthropic.__file__)
     analyzer = SDKAnalyzer(sdk_path)

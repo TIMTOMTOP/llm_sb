@@ -11,3 +11,4 @@ tiktoken
 ipywidgets
 networkx
 astor
+anthropic
