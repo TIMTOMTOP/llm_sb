@@ -14,16 +14,24 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 ###########################################
-# 1. LOAD THE CODE GRAPH AND PREPARE DATA #
+# 1. SELECT DEVICE (MPS IF AVAILABLE)     #
 ###########################################
 
+# You can use mps if it's available, otherwise fall back to CPU.
+# (Alternatively, you can do "cuda" if torch.cuda.is_available() for an NVIDIA GPU.)
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = 'cpu' ## OVERRIDE FOR NOW, to little data for MPS(Maybe I donät knwo)
+print("Using device:", device)
+
+
+###########################################
+# 2. LOAD THE CODE GRAPH AND PREPARE DATA #
+###########################################
 
 # Read your graph from a GraphML file.
-graph = nx.read_graphml("/Users/tomas/thesis_herman/c_project_graph.graphml")
+graph = nx.read_graphml("code_graphs/sdk_graph_anthropic.graphml")
 
 # Get nodes (with attributes) and edges (with attributes).
-# (Nodes in your GraphML should have an attribute 'type', and
-#  edges should have an attribute 'relationship'.)
 nodes = list(graph.nodes(data=True))
 edges = list(graph.edges(data=True))
 
@@ -39,7 +47,7 @@ node_to_idx = {node: i for i, node in enumerate(node_list)}
 # Build the edge index list.
 edge_list = []
 edge_attr_list = []  # will hold the relationship type for each edge.
-for u, v, data in G.edges(data=True):
+for u, v, data_ in G.edges(data=True):
     # Convert the original node names to indices.
     u_idx = node_to_idx[u]
     v_idx = node_to_idx[v]
@@ -47,18 +55,18 @@ for u, v, data in G.edges(data=True):
     edge_list.append((u_idx, v_idx))
     edge_list.append((v_idx, u_idx))
     # Duplicate the edge attribute for the reverse edge.
-    edge_attr_list.append(data['relationship'])
-    edge_attr_list.append(data['relationship'])
+    edge_attr_list.append(data_['relationship'])
+    edge_attr_list.append(data_['relationship'])
 
 # Convert the edge list into a tensor (shape [2, num_edges]).
 edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
 
 #############################################
-# 2. NODE INITIALIZATION BASED ON NODE TYPE #
+# 3. NODE INITIALIZATION BASED ON NODE TYPE #
 #############################################
 
 # Get the unique node types.
-unique_node_types = sorted({ data['type'] for _, data in G.nodes(data=True) })
+unique_node_types = sorted({ data_['type'] for _, data_ in G.nodes(data=True) })
 print("Unique node types:", unique_node_types)
 
 # Create a mapping from node type to index.
@@ -75,14 +83,15 @@ node_type_indices = torch.tensor(node_type_indices, dtype=torch.long)
 node_emb_dim = 16
 
 # Create an embedding layer that will (learn to) represent each node type.
-node_type_embedding = nn.Embedding(num_embeddings=len(unique_node_types), embedding_dim=node_emb_dim)
+node_type_embedding = nn.Embedding(num_embeddings=len(unique_node_types),
+                                   embedding_dim=node_emb_dim)
 
-# Now initialize the node feature matrix by “looking up” each node’s type embedding.
+# Now initialize the node feature matrix by "looking up" each node's type embedding.
 # (Shape: [num_nodes, node_emb_dim])
 x = node_type_embedding(node_type_indices)
 
 ###############################################
-# 3. EDGE INITIALIZATION BASED ON RELATIONSHIP #
+# 4. EDGE INITIALIZATION BASED ON RELATIONSHIP #
 ###############################################
 
 # Get the unique edge relationships.
@@ -100,26 +109,24 @@ edge_type_indices = torch.tensor(edge_type_indices, dtype=torch.long)
 edge_emb_dim = node_emb_dim
 
 # Create an embedding layer for edge types.
-edge_type_embedding = nn.Embedding(num_embeddings=len(unique_edge_relationships), embedding_dim=edge_emb_dim)
+edge_type_embedding = nn.Embedding(num_embeddings=len(unique_edge_relationships),
+                                   embedding_dim=edge_emb_dim)
 
 # Now initialize the edge attribute tensor.
 # (Shape: [num_edges, edge_emb_dim])
 edge_attr = edge_type_embedding(edge_type_indices)
 
 ###################################################
-# 4. CREATE THE PYG DATA OBJECT WITH ALL FEATURES #
+# 5. CREATE THE PYG DATA OBJECT WITH ALL FEATURES #
 ###################################################
 
 data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 print(data)
 
 ##########################################
-# 5. DEFINE THE GNN MODEL & TRAINING LOOP #
+# 6. DEFINE THE GNN MODEL & TRAINING LOOP #
 ##########################################
 
-# Note: The standard GCNConv does not incorporate edge attributes.
-# If you want to include edge_attr in message passing,
-# you will need to use or build an edge-aware layer.
 class SimpleGCN(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         """
@@ -140,28 +147,50 @@ class SimpleGCN(nn.Module):
 # Instantiate the model.
 model = SimpleGCN(in_channels=node_emb_dim, hidden_channels=32, out_channels=2)
 
-# Define a contrastive pair sampler (using neighbors vs. non-neighbors).
-def sample_contrastive_pairs(edge_index, num_nodes, num_negatives=3):
+####################################
+# MOVE EVERYTHING TO THE MPS DEVICE #
+####################################
+
+# Move data tensors to device
+data = data.to(device)
+
+# Move the model to device
+model = model.to(device)
+
+###########################################
+# 7. DEFINE CONTRASTIVE SAMPLING & LOSS   #
+###########################################
+
+def sample_contrastive_pairs(edge_index_, num_nodes, num_negatives=3):
     """
-    For each node, sample one positive (neighbor) and a few negatives (non-neighbors).
+    Optimized version that minimizes CPU-GPU transfers
     """
-    neighbors = {i: set() for i in range(num_nodes)}
-    edge_index_np = edge_index.cpu().numpy()
-    for src, dst in zip(edge_index_np[0], edge_index_np[1]):
-        neighbors[src].add(dst)
+    # Do this once at the start of training instead of every iteration
+    if not hasattr(sample_contrastive_pairs, 'neighbors_dict'):
+        edge_index_cpu = edge_index_.cpu().numpy()
+        neighbors = {i: set() for i in range(num_nodes)}
+        for src, dst in zip(edge_index_cpu[0], edge_index_cpu[1]):
+            neighbors[src].add(dst)
+        sample_contrastive_pairs.neighbors_dict = neighbors
     
+    neighbors = sample_contrastive_pairs.neighbors_dict
     anchors, positives, negatives = [], [], []
+    
+    # Use vectorized operations where possible
     for i in range(num_nodes):
         if len(neighbors[i]) == 0:
-            continue  # skip isolated nodes
+            continue
+        
         pos_candidates = list(neighbors[i])
         pos_sample = pos_candidates[torch.randint(len(pos_candidates), (1,)).item()]
+        
         neg_candidates = list(set(range(num_nodes)) - neighbors[i] - {i})
         if len(neg_candidates) >= num_negatives:
-            neg_sample = [neg_candidates[idx] for idx in torch.randperm(len(neg_candidates))[:num_negatives]]
+            neg_sample = torch.tensor(neg_candidates)[torch.randperm(len(neg_candidates))[:num_negatives]].tolist()
             anchors.append(i)
             positives.append(pos_sample)
             negatives.append(neg_sample)
+    
     return anchors, positives, negatives
 
 def contrastive_loss(embeddings, anchors, positives, negatives, margin=0.5):
@@ -174,27 +203,39 @@ def contrastive_loss(embeddings, anchors, positives, negatives, margin=0.5):
         anchor_emb = embeddings[i]
         pos_emb = embeddings[pos_idx]
         pos_sim = F.cosine_similarity(anchor_emb.unsqueeze(0), pos_emb.unsqueeze(0))
+        
         neg_embs = embeddings[neg_idxs]
         neg_sim = F.cosine_similarity(anchor_emb.unsqueeze(0), neg_embs)
+        
+        # We want pos_sim - neg_sim > margin
         loss_per_negative = F.relu(margin - (pos_sim - neg_sim))
         loss_all.append(loss_per_negative.mean())
     if loss_all:
         return torch.stack(loss_all).mean()
     else:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=embeddings.device)
+
+################################
+# 8. TRAINING LOOP ON MPS/CPU   #
+################################
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.005)
 num_epochs = 1001
 
-# Training loop.
+# Pre-compute neighbors dictionary before training loop
+_ = sample_contrastive_pairs(data.edge_index, data.num_nodes, num_negatives=30)
+
 model.train()
 for epoch in range(num_epochs):
     optimizer.zero_grad()
     embeddings = model(data.x, data.edge_index, data.edge_attr)
     
-    anchors, positives, negatives = sample_contrastive_pairs(data.edge_index, data.num_nodes, num_negatives=30)
-    loss = contrastive_loss(embeddings, anchors, positives, negatives, margin=0.5)
+    # Now uses cached neighbors dictionary
+    anchors, positives, negatives = sample_contrastive_pairs(
+        data.edge_index, data.num_nodes, num_negatives=30
+    )
     
+    loss = contrastive_loss(embeddings, anchors, positives, negatives, margin=0.5)
     loss.backward(retain_graph=True)
     optimizer.step()
     
